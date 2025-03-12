@@ -1,0 +1,117 @@
+import os
+import torch
+import torch.optim as optim
+from tqdm import tqdm
+
+def training_loop(model, learning_rate, train_dataloader, n_epochs, n_classes, checkpoint_interval):
+    optimizer = optim.Adam(model.parameters(), lr=learning_rate)
+    model.train()
+    loss_list = []
+
+    # Create a directory for saving checkpoints
+    checkpoint_dir = '/content/drive/MyDrive/model_checkpoints/'
+    os.makedirs(checkpoint_dir, exist_ok=True)
+
+    checkpoint_files = [file for file in os.listdir(checkpoint_dir) if file.endswith('.pt')]
+    checkpoint_files.sort()
+
+    if checkpoint_files:
+        # Load the latest checkpoint
+        latest_checkpoint_file = checkpoint_files[-1]
+        print("Resuming training from checkpoint:", latest_checkpoint_file)
+        checkpoint_path = os.path.join(checkpoint_dir, latest_checkpoint_file)
+
+        try:
+            checkpoint = torch.load(checkpoint_path)
+            resumed_epoch = checkpoint['epoch']
+            resumed_batch_idx = checkpoint['batch_idx']
+            model.load_state_dict(checkpoint['model_state_dict'])
+            optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
+            loss_list = checkpoint['loss_list']
+            print("Loaded checkpoint:", latest_checkpoint_file)
+        except Exception as e:
+            print("Error loading checkpoint:", str(e))
+            resumed_epoch = 0
+            resumed_batch_idx = -1
+    else:
+        print("Starting training from scratch.")
+        resumed_epoch = 0
+        resumed_batch_idx = -1
+
+    for epoch in tqdm(range(resumed_epoch, n_epochs)):
+        total_loss = 0
+
+        for batch_idx, (img_batch, gt_bboxes_batch, gt_classes_batch) in enumerate(train_dataloader):
+            if epoch == resumed_epoch and batch_idx <= resumed_batch_idx:
+                continue  # Skip batches that were already processed or resumed in the previous epoch
+
+            model.train()
+            img_batch = img_batch.float()
+            gt_bboxes_batch = gt_bboxes_batch.float()
+            gt_classes_batch = gt_classes_batch.to(torch.int64)
+
+            expected_range = range(n_classes)
+            invalid_indices = [
+                idx.item() for idx in gt_classes_batch.view(-1) if idx.item() not in expected_range
+            ]
+            if len(invalid_indices) > 0:
+                print("Invalid indices found in gt_classes_batch:", invalid_indices)
+                gt_classes_batch[gt_classes_batch >= n_classes] = 0
+
+            loss = model(img_batch, gt_bboxes_batch, gt_classes_batch)
+
+            optimizer.zero_grad()
+            loss.backward()
+            optimizer.step()
+
+            total_loss += loss.item()
+
+            # Save checkpoint at the specified interval
+            if (batch_idx + 1) % checkpoint_interval == 0:
+                checkpoint_file = os.path.join(checkpoint_dir, f"model_checkpoint_{epoch}_{batch_idx}.pt")
+                torch.save({
+                    'epoch': epoch,
+                    'batch_idx': batch_idx,
+                    'model_state_dict': model.state_dict(),
+                    'optimizer_state_dict': optimizer.state_dict(),
+                    'loss_list': loss_list
+                }, checkpoint_file)
+
+                print("Saved checkpoint:", checkpoint_file)
+
+                # Remove previous batch checkpoints in the same epoch
+                if batch_idx > 0:
+                    prev_batch_checkpoints = [
+                        file for file in checkpoint_files
+                        if int(file.split('_')[-1].split('.')[0]) < batch_idx and int(file.split('_')[2]) == epoch
+                    ]
+                    for checkpoint_file in prev_batch_checkpoints:
+                        checkpoint_path = os.path.join(checkpoint_dir, checkpoint_file)
+                        if os.path.exists(checkpoint_path):
+                            os.remove(checkpoint_path)
+                            print("Deleted previous checkpoint:", checkpoint_path)
+
+        loss_list.append(total_loss)
+
+    # Remove previous epoch checkpoints
+    if resumed_epoch > 0:
+        prev_epoch_checkpoints = [
+            file for file in checkpoint_files if int(file.split('_')[2].split('.')[0]) < resumed_epoch
+        ]
+        for checkpoint_file in prev_epoch_checkpoints:
+            checkpoint_path = os.path.join(checkpoint_dir, checkpoint_file)
+            if os.path.exists(checkpoint_path):
+                os.remove(checkpoint_path)
+                print("Deleted previous epoch checkpoint:", checkpoint_path)
+
+    checkpoint_files = [file for file in os.listdir(checkpoint_dir) if file.endswith('.pt')]
+
+    return loss_list
+
+
+learning_rate = 1e-3
+n_epochs = 100
+n_classes = 1  # ball only
+checkpoint_interval = 100  # Save checkpoint after every 100 batches
+
+loss_list = training_loop(detector, learning_rate, od_dataloader, n_epochs, n_classes, checkpoint_interval)
